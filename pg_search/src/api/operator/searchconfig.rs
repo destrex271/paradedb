@@ -15,7 +15,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::operator::{anyelement_jsonb_opoid, estimate_selectivity, ReturnedNodePointer};
+use crate::api::operator::{
+    anyelement_jsonb_opoid, estimate_selectivity, find_var_relation, ReturnedNodePointer,
+};
 use crate::globals::WriterGlobal;
 use crate::index::SearchIndex;
 use crate::postgres::types::TantivyValue;
@@ -23,13 +25,13 @@ use crate::postgres::utils::relfilenode_from_index_oid;
 use crate::postgres::utils::{locate_bm25_index, relfilenode_from_pg_relation};
 use crate::schema::SearchConfig;
 use crate::writer::WriterDirectory;
-use crate::{DEFAULT_STARTUP_COST, UNKNOWN_SELECTIVITY};
-use pgrx::pg_sys::planner_rt_fetch;
+use crate::{GUCS, UNKNOWN_SELECTIVITY};
 use pgrx::{
     check_for_interrupts, is_a, pg_extern, pg_func_extra, pg_sys, AnyElement, FromDatum, Internal,
     JsonB, PgList, PgOid,
 };
 use rustc_hash::FxHashSet;
+use shared::gucs::GlobalGucSettings;
 use std::ptr::NonNull;
 
 #[pg_extern(immutable, parallel_safe)]
@@ -89,13 +91,23 @@ pub fn search_config_support(arg: Internal) -> ReturnedNodePointer {
 
         match (*node).type_ {
             // our `search_with_*` functions are *incredibly* expensive.  So much so that
-            // we really don't ever want Postgres to prefer them.  As such, hardcode in some
-            // big numbers.
+            // we really don't ever want Postgres to prefer them.
+            //
+            // The higher the `per_tuple` cost is here, the better.
             pg_sys::NodeTag::T_SupportRequestCost => {
                 let src = node.cast::<pg_sys::SupportRequestCost>();
 
-                (*src).startup = DEFAULT_STARTUP_COST;
-                (*src).per_tuple = pg_sys::cpu_index_tuple_cost * 10_000.0;
+                // it can cost a lot to startup the `@@@` operator outside of an IndexScan because
+                // ultimately we have to hash all the resulting ctids in memory.  For lack of a better
+                // value, we say it costs as much as the `GUCS.per_tuple_cost()`.  This is an arbitrary
+                // number that we've documented as needing to be big.
+                (*src).startup = GUCS.per_tuple_cost();
+
+                // similarly, use the same GUC here.  Postgres will then add this into its per-tuple
+                // cost evalutations for whatever scan it's considering using for the `@@@` operator.
+                // our IAM provides more intelligent costs for the IndexScan situation.
+                (*src).per_tuple = GUCS.per_tuple_cost();
+
                 ReturnedNodePointer(NonNull::new(node))
             }
 
@@ -125,23 +137,20 @@ pub fn search_config_restrict(
                 let var = lhs.cast::<pg_sys::Var>();
                 let const_ = rhs.cast::<pg_sys::Const>();
 
-                let rte = planner_rt_fetch((*var).varno as pg_sys::Index, info);
-                if !rte.is_null() {
-                    let heaprelid = (*rte).relid;
-                    let indexrel = locate_bm25_index(heaprelid)?;
-                    let relfilenode = relfilenode_from_pg_relation(&indexrel);
+                let (heaprelid, _) = find_var_relation(var, info);
+                let indexrel = locate_bm25_index(heaprelid)?;
+                let relfilenode = relfilenode_from_pg_relation(&indexrel);
 
-                    let search_config_jsonb =
-                        JsonB::from_datum((*const_).constvalue, (*const_).constisnull)?;
-                    let search_config = SearchConfig::from_jsonb(search_config_jsonb)
-                        .expect("SearchConfig should be valid");
+                let search_config_jsonb =
+                    JsonB::from_datum((*const_).constvalue, (*const_).constisnull)?;
+                let search_config = SearchConfig::from_jsonb(search_config_jsonb)
+                    .expect("SearchConfig should be valid");
 
-                    return estimate_selectivity(
-                        pg_sys::Oid::from(search_config.table_oid),
-                        relfilenode,
-                        &search_config,
-                    );
-                }
+                return estimate_selectivity(
+                    pg_sys::Oid::from(search_config.table_oid),
+                    relfilenode,
+                    &search_config,
+                );
             }
 
             None
